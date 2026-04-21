@@ -2,25 +2,57 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <PubSubClient.h>
 #include <mcp2515.h>
 #include "pin_config.h"
 
 #define SERIAL_BAUD 115200
 
-// ===================================
-// CONFIGURACION CAN
-// ===================================
 #define CAN_SPEED   CAN_250KBPS
 #define CAN_CLOCK   MCP_16MHZ
 
+// ===================================
+// CONFIGURACION WIFI / MQTT
+// ===================================
+
+// AP local para dashboard
 const char* AP_SSID = "T2CAN_MONITOR";
 const char* AP_PASS = "12345678";
 
-static const size_t MAX_IDS = 80;
-static const size_t MAX_SIGNALS = 16;
+// WiFi STA para salida a internet/LAN
+const char* WIFI_STA_SSID = "GISULMEX_TECH";
+const char* WIFI_STA_PASS = "6EB0D7478CSPwjKj";
+
+// MQTTX / broker publico EMQX
+// En MQTTX usa:
+// Host: broker.emqx.io
+// Port: 1883
+// Username/Password: vacios
+// Subscribe topic: cantest2026/demo01/#
+const char* MQTT_HOST = "broker.emqx.io";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER = "";
+const char* MQTT_PASS = "";
+const char* MQTT_CLIENT_ID = "cantest2026_esp32_demo01";
+const char* MQTT_TOPIC_SIGNALS = "cantest2026/demo01/signals";
+const char* MQTT_TOPIC_STATUS  = "cantest2026/demo01/status";
+
+// Publicacion
+const unsigned long MQTT_PUBLISH_INTERVAL_MS = 1000;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
+const unsigned long MQTT_RETRY_INTERVAL_MS = 5000;
+
+// Dispositivo
+const char* DEVICE_NAME = "demo01";
+
 // ===================================
 
+static const size_t MAX_IDS = 80;
+static const size_t MAX_SIGNALS = 16;
+
 WebServer server(80);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 MCP2515 canBus(MCP2515_CS);
 struct can_frame rxFrame;
 
@@ -41,21 +73,24 @@ FrameState states[MAX_IDS];
 uint32_t nextOrder = 1;
 bool canStarted = false;
 
+unsigned long lastWifiAttemptMs = 0;
+unsigned long lastMqttAttemptMs = 0;
+unsigned long lastMqttPublishMs = 0;
+
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
-// =========================
-// SEÑALES DECODIFICADAS
-// =========================
 enum SignalType {
   SIGNAL_HEX = 0,
   SIGNAL_MAP = 1,
   SIGNAL_U24_LE_DIV128 = 2,
-  SIGNAL_S8_KMH = 3
+  SIGNAL_S8_KMH = 3,
+  SIGNAL_FORK_MOTION = 4
 };
 
 struct SignalRule {
   bool enabled;
   const char* name;
+  const char* key;   // clave JSON
   uint32_t id;
   bool ext;
   uint8_t byteIndex;
@@ -73,17 +108,31 @@ SignalRule signalRules[MAX_SIGNALS] = {
   {
     true,
     "Dirección",
+    "direccion",
     0x18A,
     false,
     6,
     SIGNAL_MAP,
-    0x20, "Reversa",
-    0x40, "Adelante",
+    0x20, "Adelante",
+    0x40, "Reversa",
     0x00, "Detenido/Neutro"
   },
   {
     true,
+    "Elevación horquillas",
+    "elevacion_horquillas",
+    0x18A,
+    false,
+    0,
+    SIGNAL_FORK_MOTION,
+    0x00, "",
+    0x00, "",
+    0x00, ""
+  },
+  {
+    true,
     "Horómetro",
+    "horometro_h",
     0x183,
     false,
     0,
@@ -95,21 +144,11 @@ SignalRule signalRules[MAX_SIGNALS] = {
   {
     true,
     "Velocidad",
+    "velocidad",
     0x205,
     false,
     2,
     SIGNAL_S8_KMH,
-    0x00, "",
-    0x00, "",
-    0x00, ""
-  },
-  {
-    false,
-    "Horquillas",
-    0x000,
-    false,
-    0,
-    SIGNAL_HEX,
     0x00, "",
     0x00, "",
     0x00, ""
@@ -130,6 +169,17 @@ String byteToHex(uint8_t v) {
   char b[3];
   snprintf(b, sizeof(b), "%02X", v);
   return String(b);
+}
+
+String jsonEscape(const String& s) {
+  String out;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '\"') out += "\\\"";
+    else if (c == '\\') out += "\\\\";
+    else out += c;
+  }
+  return out;
 }
 
 int findFrameIndexInArray(FrameState* arr, uint32_t id, bool ext) {
@@ -243,6 +293,182 @@ bool startCAN() {
   return true;
 }
 
+String decodeSignalValue(const SignalRule& rule, const FrameState& frame) {
+  if (rule.byteIndex >= frame.dlc) return "N/A";
+
+  if (rule.type == SIGNAL_HEX) {
+    return "0x" + byteToHex(frame.data[rule.byteIndex]);
+  }
+
+  if (rule.type == SIGNAL_MAP) {
+    uint8_t rawByte = frame.data[rule.byteIndex];
+    if (rawByte == rule.mapValue1) return String(rule.mapLabel1);
+    if (rawByte == rule.mapValue2) return String(rule.mapLabel2);
+    if (rawByte == rule.mapValue3) return String(rule.mapLabel3);
+    return "0x" + byteToHex(rawByte);
+  }
+
+  if (rule.type == SIGNAL_U24_LE_DIV128) {
+    if (rule.byteIndex + 2 >= frame.dlc) return "N/A";
+
+    uint32_t raw =
+      ((uint32_t)frame.data[rule.byteIndex]) |
+      ((uint32_t)frame.data[rule.byteIndex + 1] << 8) |
+      ((uint32_t)frame.data[rule.byteIndex + 2] << 16);
+
+    float hours = raw / 128.0f;
+
+    char out[24];
+    snprintf(out, sizeof(out), "%.2f h", hours);
+    return String(out);
+  }
+
+  if (rule.type == SIGNAL_S8_KMH) {
+    int8_t signedSpeed = (int8_t)frame.data[rule.byteIndex];
+    float speedKmh = signedSpeed / 4.75f;
+
+    char out[32];
+    if (speedKmh < 0) {
+      snprintf(out, sizeof(out), "Reversa %.1f km/h", -speedKmh);
+    } else if (speedKmh > 0) {
+      snprintf(out, sizeof(out), "Adelante %.1f km/h", speedKmh);
+    } else {
+      snprintf(out, sizeof(out), "0.0 km/h");
+    }
+    return String(out);
+  }
+
+  if (rule.type == SIGNAL_FORK_MOTION) {
+    uint8_t raw = frame.data[rule.byteIndex];
+
+    if (raw == 0x00) return "Sin movimiento";
+    if (raw >= 0x80) return "Subiendo";
+    return "Bajando";
+  }
+
+  return "N/A";
+}
+
+String buildMqttSignalJsonValue(const SignalRule& rule, const FrameState& frame) {
+  if (rule.byteIndex >= frame.dlc) return "null";
+
+  if (rule.type == SIGNAL_S8_KMH) {
+    int8_t signedSpeed = (int8_t)frame.data[rule.byteIndex];
+    float speedKmh = signedSpeed / 4.75f;
+
+    char out[16];
+    snprintf(out, sizeof(out), "%.2f", speedKmh);
+    return String(out);
+  }
+
+  String value = decodeSignalValue(rule, frame);
+  return "\"" + jsonEscape(value) + "\"";
+}
+
+String getRawSignalString(const SignalRule& rule, const FrameState& frame) {
+  if (rule.byteIndex >= frame.dlc) return "N/A";
+
+  if (rule.type == SIGNAL_U24_LE_DIV128) {
+    if (rule.byteIndex + 2 >= frame.dlc) return "N/A";
+
+    String s = "0x";
+    s += byteToHex(frame.data[rule.byteIndex + 2]);
+    s += byteToHex(frame.data[rule.byteIndex + 1]);
+    s += byteToHex(frame.data[rule.byteIndex]);
+    return s;
+  }
+
+  return "0x" + byteToHex(frame.data[rule.byteIndex]);
+}
+
+String buildSignalsJson() {
+  FrameState snap[MAX_IDS];
+
+  portENTER_CRITICAL(&mux);
+  memcpy(snap, states, sizeof(states));
+  portEXIT_CRITICAL(&mux);
+
+  String json = "{";
+  json += "\"device\":\"" + String(DEVICE_NAME) + "\",";
+  json += "\"ts_ms\":" + String(millis()) + ",";
+  json += "\"signals\":{";
+
+  bool firstSignal = true;
+
+  for (size_t s = 0; s < MAX_SIGNALS; s++) {
+    if (!signalRules[s].enabled) continue;
+
+    int idx = findFrameIndexInArray(snap, signalRules[s].id, signalRules[s].ext);
+    if (idx < 0) continue;
+
+    const FrameState &frame = snap[idx];
+    if (!frame.valid) continue;
+
+    if (!firstSignal) json += ",";
+    firstSignal = false;
+
+    json += "\"" + String(signalRules[s].key) + "\":";
+    json += buildMqttSignalJsonValue(signalRules[s], frame);
+  }
+
+  json += "}}";
+  return json;
+}
+
+void connectStaWiFiIfNeeded() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  unsigned long now = millis();
+  if (now - lastWifiAttemptMs < WIFI_RETRY_INTERVAL_MS) return;
+  lastWifiAttemptMs = now;
+
+  Serial.printf("Conectando a WiFi STA: %s\n", WIFI_STA_SSID);
+  WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASS);
+}
+
+void connectMqttIfNeeded() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (mqttClient.connected()) return;
+
+  unsigned long now = millis();
+  if (now - lastMqttAttemptMs < MQTT_RETRY_INTERVAL_MS) return;
+  lastMqttAttemptMs = now;
+
+  Serial.printf("Conectando a MQTT %s:%u ...\n", MQTT_HOST, MQTT_PORT);
+
+  bool ok;
+  if (strlen(MQTT_USER) > 0) {
+    ok = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);
+  } else {
+    ok = mqttClient.connect(MQTT_CLIENT_ID);
+  }
+
+  if (ok) {
+    Serial.println("MQTT conectado");
+    Serial.printf("Client ID: %s\n", MQTT_CLIENT_ID);
+    Serial.printf("Topic signals: %s\n", MQTT_TOPIC_SIGNALS);
+    Serial.printf("Topic status: %s\n", MQTT_TOPIC_STATUS);
+    mqttClient.publish(MQTT_TOPIC_STATUS, "{\"status\":\"online\"}", true);
+  } else {
+    Serial.printf("MQTT fallo rc=%d\n", mqttClient.state());
+  }
+}
+
+void publishMqttSignalsIfNeeded() {
+  if (!mqttClient.connected()) return;
+
+  unsigned long now = millis();
+  if (now - lastMqttPublishMs < MQTT_PUBLISH_INTERVAL_MS) return;
+  lastMqttPublishMs = now;
+
+  String payload = buildSignalsJson();
+  bool ok = mqttClient.publish(MQTT_TOPIC_SIGNALS, payload.c_str(), true);
+
+  Serial.println("MQTT publish:");
+  Serial.println(payload);
+  Serial.printf("Resultado: %s\n", ok ? "OK" : "FAIL");
+}
+
 const char PAGE_INDEX[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="es">
@@ -252,205 +478,42 @@ const char PAGE_INDEX[] PROGMEM = R"rawliteral(
   <title>Plataforma remota lector CAN</title>
   <style>
     :root{
-      --bg:#0c1220;
-      --panel:#141c31;
-      --panel2:#10172b;
-      --line:#2b385e;
-      --text:#eef3ff;
-      --muted:#9ba9cf;
-      --chip:#1c2747;
-      --chipBorder:#334471;
-      --flash:#ffd166;
-      --flashText:#2a1c00;
-      --accent:#7da8ff;
-      --good:#79e0b8;
+      --bg:#0c1220; --panel:#141c31; --panel2:#10172b; --line:#2b385e;
+      --text:#eef3ff; --muted:#9ba9cf; --chip:#1c2747; --chipBorder:#334471;
+      --flash:#ffd166; --flashText:#2a1c00; --accent:#7da8ff; --good:#79e0b8;
     }
     *{box-sizing:border-box}
-    body{
-      margin:0;
-      font-family:Inter,Segoe UI,Arial,sans-serif;
-      background:linear-gradient(180deg,#0a1020,#10182d);
-      color:var(--text);
-    }
-    .wrap{
-      max-width:1400px;
-      margin:auto;
-      padding:18px;
-    }
-    .top{
-      background:linear-gradient(180deg,var(--panel),var(--panel2));
-      border:1px solid var(--line);
-      border-radius:18px;
-      padding:18px;
-      margin-bottom:14px;
-      box-shadow:0 8px 24px rgba(0,0,0,.22);
-    }
-    h1{
-      margin:0 0 6px;
-      font-size:28px;
-    }
-    .sub{
-      margin:0;
-      color:var(--muted);
-      font-size:14px;
-    }
-    .toolbar{
-      display:flex;
-      justify-content:space-between;
-      align-items:center;
-      flex-wrap:wrap;
-      gap:10px;
-      background:linear-gradient(180deg,var(--panel),var(--panel2));
-      border:1px solid var(--line);
-      border-radius:18px;
-      padding:14px 16px;
-      margin-bottom:14px;
-    }
-    .left,.right{
-      display:flex;
-      align-items:center;
-      gap:10px;
-      flex-wrap:wrap;
-    }
-    button,input{
-      background:#111936;
-      color:var(--text);
-      border:1px solid #344372;
-      border-radius:12px;
-      padding:10px 12px;
-      font-weight:700;
-    }
+    body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#0a1020,#10182d);color:var(--text)}
+    .wrap{max-width:1400px;margin:auto;padding:18px}
+    .top,.toolbar,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:18px;box-shadow:0 8px 24px rgba(0,0,0,.22)}
+    .top{padding:18px;margin-bottom:14px}
+    h1{margin:0 0 6px;font-size:28px}
+    .sub{margin:0;color:var(--muted);font-size:14px}
+    .toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;padding:14px 16px;margin-bottom:14px}
+    .left,.right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+    button,input{background:#111936;color:var(--text);border:1px solid #344372;border-radius:12px;padding:10px 12px;font-weight:700}
     button{cursor:pointer}
-    .pill{
-      padding:9px 12px;
-      border-radius:999px;
-      border:1px solid var(--line);
-      color:var(--muted);
-      background:#111936;
-      font-size:13px;
-    }
-    .layout{
-      display:grid;
-      grid-template-columns: 1.5fr .9fr;
-      gap:14px;
-      align-items:start;
-    }
-    .card{
-      background:linear-gradient(180deg,var(--panel),var(--panel2));
-      border:1px solid var(--line);
-      border-radius:18px;
-      overflow:hidden;
-      box-shadow:0 8px 24px rgba(0,0,0,.22);
-    }
-    .cardTitle{
-      padding:16px 18px;
-      border-bottom:1px solid var(--line);
-      font-size:16px;
-      font-weight:800;
-      color:var(--accent);
-    }
-    .tableWrap{
-      overflow:auto;
-      max-height:76vh;
-    }
-    table{
-      width:100%;
-      border-collapse:collapse;
-      min-width:760px;
-    }
-    thead th{
-      position:sticky;
-      top:0;
-      z-index:2;
-      background:#16203b;
-      color:#b8c4e8;
-      text-align:left;
-      font-size:12px;
-      padding:12px;
-      border-bottom:1px solid var(--line);
-    }
-    tbody td{
-      padding:12px;
-      border-bottom:1px solid rgba(75,91,140,.35);
-      font-size:14px;
-      vertical-align:middle;
-    }
-    tbody tr:nth-child(odd){
-      background:rgba(255,255,255,.015);
-    }
-    .mono{
-      font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-    }
-    .idTag{
-      display:inline-block;
-      padding:6px 10px;
-      border-radius:10px;
-      background:#111936;
-      border:1px solid #344372;
-      font-weight:800;
-    }
-    .bytes{
-      display:flex;
-      gap:8px;
-      flex-wrap:wrap;
-    }
-    .byte{
-      min-width:42px;
-      text-align:center;
-      padding:8px 10px;
-      border-radius:10px;
-      background:var(--chip);
-      border:1px solid var(--chipBorder);
-      font-weight:800;
-      transition:background-color .15s ease, color .15s ease, transform .15s ease;
-    }
-    .byte.flash{
-      background:var(--flash);
-      color:var(--flashText);
-      border-color:#ffde8a;
-      transform:scale(1.04);
-    }
-    .muted{
-      color:var(--muted);
-    }
-    .signals{
-      padding:14px;
-      display:flex;
-      flex-direction:column;
-      gap:12px;
-    }
-    .signalCard{
-      border:1px solid var(--line);
-      background:rgba(255,255,255,.02);
-      border-radius:14px;
-      padding:14px;
-    }
-    .signalName{
-      font-size:15px;
-      font-weight:800;
-      margin-bottom:8px;
-      color:var(--good);
-    }
-    .signalValue{
-      font-size:22px;
-      font-weight:900;
-      margin-bottom:8px;
-    }
-    .signalMeta{
-      font-size:12px;
-      color:var(--muted);
-      line-height:1.5;
-    }
-    .emptyNote{
-      color:var(--muted);
-      padding:16px;
-      font-size:14px;
-    }
-    @media (max-width:1100px){
-      .layout{
-        grid-template-columns:1fr;
-      }
-    }
+    .pill{padding:9px 12px;border-radius:999px;border:1px solid var(--line);color:var(--muted);background:#111936;font-size:13px}
+    .layout{display:grid;grid-template-columns:1.5fr .9fr;gap:14px;align-items:start}
+    .cardTitle{padding:16px 18px;border-bottom:1px solid var(--line);font-size:16px;font-weight:800;color:var(--accent)}
+    .tableWrap{overflow:auto;max-height:76vh}
+    table{width:100%;border-collapse:collapse;min-width:760px}
+    thead th{position:sticky;top:0;z-index:2;background:#16203b;color:#b8c4e8;text-align:left;font-size:12px;padding:12px;border-bottom:1px solid var(--line)}
+    tbody td{padding:12px;border-bottom:1px solid rgba(75,91,140,.35);font-size:14px;vertical-align:middle}
+    tbody tr:nth-child(odd){background:rgba(255,255,255,.015)}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    .idTag{display:inline-block;padding:6px 10px;border-radius:10px;background:#111936;border:1px solid #344372;font-weight:800}
+    .bytes{display:flex;gap:8px;flex-wrap:wrap}
+    .byte{min-width:42px;text-align:center;padding:8px 10px;border-radius:10px;background:var(--chip);border:1px solid var(--chipBorder);font-weight:800;transition:background-color .15s ease,color .15s ease,transform .15s ease}
+    .byte.flash{background:var(--flash);color:var(--flashText);border-color:#ffde8a;transform:scale(1.04)}
+    .muted{color:var(--muted)}
+    .signals{padding:14px;display:flex;flex-direction:column;gap:12px}
+    .signalCard{border:1px solid var(--line);background:rgba(255,255,255,.02);border-radius:14px;padding:14px}
+    .signalName{font-size:15px;font-weight:800;margin-bottom:8px;color:var(--good)}
+    .signalValue{font-size:22px;font-weight:900;margin-bottom:8px}
+    .signalMeta{font-size:12px;color:var(--muted);line-height:1.5}
+    .emptyNote{color:var(--muted);padding:16px;font-size:14px}
+    @media (max-width:1100px){.layout{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
@@ -631,65 +694,6 @@ fetchData();
 </html>
 )rawliteral";
 
-String decodeSignalValue(const SignalRule& rule, const FrameState& frame) {
-  if (rule.byteIndex >= frame.dlc) return "N/A";
-
-  if (rule.type == SIGNAL_HEX) {
-    return "0x" + byteToHex(frame.data[rule.byteIndex]);
-  }
-
-  if (rule.type == SIGNAL_MAP) {
-    uint8_t rawByte = frame.data[rule.byteIndex];
-    if (rawByte == rule.mapValue1) return String(rule.mapLabel1);
-    if (rawByte == rule.mapValue2) return String(rule.mapLabel2);
-    if (rawByte == rule.mapValue3) return String(rule.mapLabel3);
-    return "0x" + byteToHex(rawByte);
-  }
-
-  if (rule.type == SIGNAL_U24_LE_DIV128) {
-    if (rule.byteIndex + 2 >= frame.dlc) return "N/A";
-
-    uint32_t raw =
-      ((uint32_t)frame.data[rule.byteIndex]) |
-      ((uint32_t)frame.data[rule.byteIndex + 1] << 8) |
-      ((uint32_t)frame.data[rule.byteIndex + 2] << 16);
-
-    float hours = raw / 128.0f;
-
-    char out[24];
-    snprintf(out, sizeof(out), "%.2f h", hours);
-    return String(out);
-  }
-
-  if (rule.type == SIGNAL_S8_KMH) {
-    int8_t signedSpeed = (int8_t)frame.data[rule.byteIndex];
-
-    float speedKmh = signedSpeed / 4.75f;
-
-    char out[24];
-    snprintf(out, sizeof(out), "%.1f km/h", speedKmh);
-    return String(out);
-  }
-
-  return "N/A";
-}
-
-String getRawSignalString(const SignalRule& rule, const FrameState& frame) {
-  if (rule.byteIndex >= frame.dlc) return "N/A";
-
-  if (rule.type == SIGNAL_U24_LE_DIV128) {
-    if (rule.byteIndex + 2 >= frame.dlc) return "N/A";
-
-    String s = "0x";
-    s += byteToHex(frame.data[rule.byteIndex + 2]);
-    s += byteToHex(frame.data[rule.byteIndex + 1]);
-    s += byteToHex(frame.data[rule.byteIndex]);
-    return s;
-  }
-
-  return "0x" + byteToHex(frame.data[rule.byteIndex]);
-}
-
 void handleRoot() {
   server.send_P(200, "text/html", PAGE_INDEX);
 }
@@ -769,16 +773,16 @@ void handleData() {
 }
 
 void startWiFiAP() {
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS);
 
   Serial.println();
   Serial.println("WiFi AP iniciado");
-  Serial.print("SSID: ");
+  Serial.print("AP SSID: ");
   Serial.println(AP_SSID);
-  Serial.print("PASS: ");
+  Serial.print("AP PASS: ");
   Serial.println(AP_PASS);
-  Serial.print("IP: ");
+  Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
 }
 
@@ -796,7 +800,7 @@ void setup() {
   delay(2000);
 
   Serial.println();
-  Serial.println("=== T2CAN COMPACT MONITOR ===");
+  Serial.println("=== T2CAN COMPACT MONITOR + MQTT ===");
   Serial.println("Objetivo: 250 kbps, Listen Only, Accept All");
   Serial.printf("MCP2515_CS   = %d\n", MCP2515_CS);
   Serial.printf("MCP2515_SCLK = %d\n", MCP2515_SCLK);
@@ -811,25 +815,38 @@ void setup() {
     while (true) delay(1000);
   }
 
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setBufferSize(1024);
+
+  startWiFiAP();
+  connectStaWiFiIfNeeded();
+  startWebServer();
+
   Serial.println("MCP2515 listo");
   Serial.println("Modo: Listen Only");
   Serial.println("Velocidad: 250 kbps");
   Serial.println("Clock: 16 MHz");
-
-  startWiFiAP();
-  startWebServer();
+  Serial.printf("MQTT host: %s:%u\n", MQTT_HOST, MQTT_PORT);
 }
 
 void loop() {
   server.handleClient();
 
-  if (!canStarted) return;
+  if (canStarted) {
+    auto err = canBus.readMessage(&rxFrame);
 
-  auto err = canBus.readMessage(&rxFrame);
+    if (err == MCP2515::ERROR_OK) {
+      updateStateFromFrame(rxFrame);
+    } else if (err != MCP2515::ERROR_NOMSG) {
+      delay(5);
+    }
+  }
 
-  if (err == MCP2515::ERROR_OK) {
-    updateStateFromFrame(rxFrame);
-  } else if (err != MCP2515::ERROR_NOMSG) {
-    delay(5);
+  connectStaWiFiIfNeeded();
+  connectMqttIfNeeded();
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    publishMqttSignalsIfNeeded();
   }
 }
